@@ -107,6 +107,56 @@ def prefill_kv_cache_with_encoder(
   return kv_cache, encoder_logits, positions, attention_mask
 
 
+def _encode_self_conditioning(
+    embedder: Any,
+    *,
+    sc_logits: jnp.ndarray | None,
+    sc_mask: jnp.ndarray | None,
+    batch_size: int,
+    canvas_length: int,
+    vocab_size: int,
+    dtype: Any,
+) -> jnp.ndarray:
+  """Encodes self-conditioning while preserving an exact-zero sentinel.
+
+  Zero vocabulary logits do not represent zero self-conditioning because
+  ``encode_logits`` applies a softmax before projecting through the embedding
+  table. SFT currently uses all-zero logits as the disabled sentinel, so mask
+  the encoded signal itself for those examples. An explicit mask can also be
+  supplied by callers that already track self-conditioning enablement.
+
+  Args:
+    embedder: Gemma token embedder exposing ``encode_logits``.
+    sc_logits: Optional self-conditioning logits of shape ``[B, L, V]``.
+    sc_mask: Optional per-example or broadcastable boolean enable mask.
+    batch_size: Batch size.
+    canvas_length: Number of denoised tokens.
+    vocab_size: Vocabulary size.
+    dtype: Logit dtype used when an absent signal needs a placeholder tensor.
+
+  Returns:
+    Self-conditioning embeddings with disabled examples set exactly to zero.
+  """
+  if sc_logits is None:
+    sc_logits = jnp.zeros(
+        (batch_size, canvas_length, vocab_size), dtype=dtype
+    )
+    # Keep the encode call below for parameter-initialization behaviour, but
+    # explicitly mark the missing signal as disabled after encoding.
+    sc_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
+  elif sc_mask is None:
+    # SFT masks disabled examples by replacing their entire logit tensor with
+    # zeros. Preserve that sentinel across the logit-to-embedding boundary.
+    reduce_axes = tuple(range(1, sc_logits.ndim))
+    sc_mask = jnp.any(sc_logits != 0, axis=reduce_axes)
+
+  sc_embeddings = embedder.encode_logits(sc_logits)
+  sc_mask = jnp.asarray(sc_mask, dtype=jnp.bool_)
+  while sc_mask.ndim < sc_embeddings.ndim:
+    sc_mask = sc_mask[..., None]
+  return jnp.where(sc_mask, sc_embeddings, jnp.zeros_like(sc_embeddings))
+
+
 ################################################################################
 # WrappedDiffusionGemmaNetwork Wrapper
 ################################################################################
@@ -197,8 +247,8 @@ class WrappedDiffusionGemmaNetwork(nn.Module):
     Args:
       time: Diffusion time steps.
       xt: Noisy canvas tokens or array.
-      conditioning: Dictionary containing cache, positions, attention_mask, and
-        sc_logits.
+      conditioning: Dictionary containing cache, positions, attention_mask,
+        sc_logits, and an optional self-conditioning enable mask.
       is_training: Whether operating in training mode.
 
     Returns:
@@ -222,17 +272,21 @@ class WrappedDiffusionGemmaNetwork(nn.Module):
     # The HD pipeline passes the self-conditioning signal as raw logits
     # (shape [B, L, V]) under the key 'sc_logits' in the conditioning dict.
     sc_logits = conditioning.get('sc_logits', None)
-    if sc_logits is None:
-      sc_logits = jnp.zeros(
-          (batch_size, canvas_length, vocab_size), dtype=dtype
-      )
+    sc_mask = conditioning.get('sc_mask', None)
 
     positions = conditioning.get('positions', None)
     kv_cache = conditioning.get('kv_cache', None)
     attention_mask = conditioning.get('attention_mask', None)
 
-    # We keep this call to maintain the param init behavior.
-    sc_embeddings = self.gemma_model.embedder.encode_logits(sc_logits)
+    sc_embeddings = _encode_self_conditioning(
+        self.gemma_model.embedder,
+        sc_logits=sc_logits,
+        sc_mask=sc_mask,
+        batch_size=batch_size,
+        canvas_length=canvas_length,
+        vocab_size=vocab_size,
+        dtype=dtype,
+    )
 
     transformer_output = self.gemma_model.call_with_self_conditioning(
         tokens=tokens,
